@@ -132,15 +132,15 @@ module KyotoIndex
       end
 
       def summary_for(id, db = :default)
-        kt(db).get("#{namespace}::summary::#{id}")
+        kt(db).get("#{ki_namespace}::summary::#{id}")
       end
       
       def store_summary_for(id, summary, db = :default)
-        kt(db).set("#{namespace}::summary::#{id}", summary)
+        kt(db).set("#{ki_namespace}::summary::#{id}", summary)
       end
       
       def remove_summary_for(id, db = :default)
-        kt(db).remove("#{namespace}::summary::#{id}")
+        kt(db).remove("#{ki_namespace}::summary::#{id}")
       end
       
       def prepare_term(field, term)
@@ -156,20 +156,20 @@ module KyotoIndex
       end
 
       def key_for(field, term_id)
-        "#{namespace}:#{field.to_s}:#{term_id}"
+        "#{ki_namespace}:#{field.to_s}:#{term_id}"
       end
       
       def term_id_for(term, db = :default)
-        term_id = kt(db).get("#{namespace}::term_id::#{term}")
+        term_id = kt(db).get("#{ki_namespace}::term_id::#{term}")
         unless term_id
-          term_id = kt(db).increment("#{namespace}::next_term_id")
-          kt(db).set("#{namespace}::term_id::#{term}", term_id)
+          term_id = kt(db).increment("#{ki_namespace}::next_term_id")
+          kt(db).set("#{ki_namespace}::term_id::#{term}", term_id)
         end
         term_id.to_i
       end
       
-      def namespace
-        @namespace ||= "KyotoIndex::#{self.name}"
+      def ki_namespace
+        @ki_namespace ||= "KyotoIndex::#{self.name}"
       end
     end
 
