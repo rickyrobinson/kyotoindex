@@ -132,15 +132,15 @@ module KyotoIndex
       end
 
       def summary_for(id, db = :default)
-        kt(db).get("#{self.name}::summary::#{id}")
+        kt(db).get("#{namespace}::summary::#{id}")
       end
       
       def store_summary_for(id, summary, db = :default)
-        kt(db).set("#{self.name}::summary::#{id}", summary)
+        kt(db).set("#{namespace}::summary::#{id}", summary)
       end
       
       def remove_summary_for(id, db = :default)
-        kt(db).remove("#{self.name}::summary::#{id}")
+        kt(db).remove("#{namespace}::summary::#{id}")
       end
       
       def prepare_term(field, term)
@@ -156,16 +156,20 @@ module KyotoIndex
       end
 
       def key_for(field, term_id)
-        "#{self.name}:#{field.to_s}:#{term_id}"
+        "#{namespace}:#{field.to_s}:#{term_id}"
       end
       
       def term_id_for(term, db = :default)
-        term_id = kt(db).get("#{self.name}::term_id::#{term}")
+        term_id = kt(db).get("#{namespace}::term_id::#{term}")
         unless term_id
-          term_id = kt(db).increment("#{self.name}::unique_terms")
-          kt(db).set("#{self.name}::term_id::#{term}", term_id)
+          term_id = kt(db).increment("#{namespace}::next_term_id")
+          kt(db).set("#{namespace}::term_id::#{term}", term_id)
         end
         term_id.to_i
+      end
+      
+      def namespace
+        @namespace ||= "KyotoIndex::#{self.name}"
       end
     end
 
@@ -263,7 +267,7 @@ module KyotoIndex
         idx = self.class.get_bulk(entries.keys)
         entries.each do |k, freq|
           idx[k] = {} unless idx[k]
-          idx[k][self.id] = freq
+          idx[k][id] = freq
         end
         self.class.set_bulk(idx)
         nil
