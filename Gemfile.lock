@@ -1,0 +1,25 @@
+GIT
+  remote: git://github.com/rickyrobinson/kyototycoon-ruby.git
+  revision: 4d01565c18886f8fad155bae43dc77425e1b1008
+  specs:
+    kyototycoon (0.5.4)
+      msgpack
+
+PATH
+  remote: .
+  specs:
+    kyotoindex (0.0.1)
+      kyototycoon
+      msgpack
+
+GEM
+  remote: http://rubygems.org/
+  specs:
+    msgpack (0.4.5)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  kyotoindex!
+  kyototycoon!

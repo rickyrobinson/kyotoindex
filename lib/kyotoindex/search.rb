@@ -11,8 +11,6 @@ module KyotoIndex
 
     module ClassMethods
       
-      DEFAULT_STOP_WORDS = %w(& a able about across after all almost also am among an and any are as at be because been but by can cannot could dear did do does either else ever every for from get got had has have he her hers him his how however i if in into is it its just least let like likely may me might most must my neither no nor not of off often on only or other our own rather said say says she should since so some than that the their them then there these they this tis to too twas us wants was we were what when where which while who whom why will with would yet you your)
-      
       attr_reader :index_config
       
       # Specify one or more attributes to index.
@@ -28,9 +26,11 @@ module KyotoIndex
       def add_index(*args)
         options = args.last.is_a?(::Hash) ? args.pop : {}
         options[:ngram] ||= 1
+        options[:weight] ||= 1.0
         options[:minlength] ||= 2
         options[:split] ||= /\s+/
-        options[:stopwords] ||= DEFAULT_STOP_WORDS
+        options[:sentence_split] ||= /[.?!;](?: |$)/
+        options[:stopwords] ||= KyotoIndex.stopwords
         options[:db] ||= :default
         args.each do |attribute|
           index_config[attribute.to_sym] = options
@@ -124,22 +124,23 @@ module KyotoIndex
       end
       
       def get_bulk(keys, db = :default)
-        bulk=kt(db).get_bulk(keys)
-        bulk.delete("num")
-        bulk = bulk.reduce({}) do |hash, (k,v)|
-          key = k.match("^_") ? k[1..-1] : k
-          hash[key] = v
-          hash
-        end
-        bulk
+        kt(db).get_bulk(keys)
       end
 
       def set_bulk(recs, db = :default)
         kt(db).set_bulk(recs)
       end
 
-      def index_keys_for(id, db = :default)
-        kt(db).get("#{self.name}::#{id}")
+      def summary_for(id, db = :default)
+        kt(db).get("#{self.name}::summary::#{id}")
+      end
+      
+      def store_summary_for(id, summary, db = :default)
+        kt(db).set("#{self.name}::summary::#{id}", summary)
+      end
+      
+      def remove_summary_for(id, db = :default)
+        kt(db).remove("#{self.name}::summary::#{id}")
       end
       
       def prepare_term(field, term)
@@ -154,10 +155,18 @@ module KyotoIndex
         term.gsub(/[^\w\s]+/, '').gsub(/\s{2,}/, ' ').downcase
       end
 
-      def key_for(field, term)
-        "#{self.name}:#{field.to_s}:#{term}"
+      def key_for(field, term_id)
+        "#{self.name}:#{field.to_s}:#{term_id}"
       end
-
+      
+      def term_id_for(term, db = :default)
+        term_id = kt(db).get("#{self.name}::term_id::#{term}")
+        unless term_id
+          term_id = kt(db).increment("#{self.name}::unique_terms")
+          kt(db).set("#{self.name}::term_id::#{term}", term_id)
+        end
+        term_id.to_i
+      end
     end
 
     module InstanceMethods
@@ -166,31 +175,47 @@ module KyotoIndex
       # @note This currently assumes the object has not been previously indexed
       def index(*fields)
         fields = self.class.indexed_fields if fields.empty?
-        keys = []
+        index_entries = {}
         fields.each do |field|
+          field_entries = Hash.new(0)
           options = self.class.index_config[field]
           value = self.send(field)
           next if value.nil?
-          values = nil
+          sentences = nil
           if value.is_a?(Array)
-            values = value.map {|s| options[:split] ? s.split(options[:split]) : s }.flatten
+            sentences = value
           else
-            values = options[:split] ? value.split(options[:split]) : value
+            sentences = options[:sentence_split] ? value.split(options[:sentence_split]) : [value]
           end
+            
+          sentence_terms = sentences.map {|s| options[:split] ? s.split(options[:split]) : [s]}
+          
+          entry = {"total_words" => sentence_terms.reduce(0) {|sum, st| sum += st.length}, "keys" => []}
+          
+          sentence_terms.each do |terms|
+            (1..options[:ngram]).each do |n|
+              terms.each_cons(n) do |seq|
+                # We don't care about this ngram if it starts or ends with a stop word
+                # The non-stop word portion of the string will already have been indexed
+                # on a previous iteration. i.e., when n was smaller.
+                next if options[:stopwords].any? { |x| [seq.first, seq.last].include? x }
+                # Concatenate ngram components and remove non alphanum/whitespace chars.
+                ngram = self.class.clean_term(seq.join(" "))
+                next if ngram.length < options[:minlength]
+              
+                field_entries[ngram] += 1
 
-          (1..options[:ngram]).each do |n|
-            values.each_cons(n) do |seq|
-              # We don't care about this ngram if it starts or ends with a stop word
-              # The non-stop word portion of the string will already have been indexed
-              # on a previous iteration. i.e., when n was smaller.
-              next if options[:stopwords].any? { |x| [seq.first, seq.last].include? x }
-              # Concatenate ngram components and remove non alphanum/whitespace chars.
-              ngram = self.class.clean_term(seq.join(" "))
-              next if ngram.length < options[:minlength]
-              k = self.class.key_for(field, ngram)
-              keys << k
+              end
             end
           end
+          
+          field_entries.each do |ngram, count|
+            term_id = self.class.term_id_for(ngram)
+            key = self.class.key_for(field, term_id)
+            index_entries[key] = count / entry["total_words"].to_f
+            entry["keys"] << key
+          end
+          
           nil
         end
 
@@ -202,7 +227,8 @@ module KyotoIndex
         # next if new_keys.empty? and del_keys.empty?
 
         # Add new indices
-        store_at_keys(keys)
+        store(index_entries)
+        store_summary(entry)
 
         # # Delete indexes no longer used
         # exec_pipelined_index_cmd(:srem, del_indexes)
@@ -216,23 +242,43 @@ module KyotoIndex
         index(fields)
       end
 
-      def unindex(*fields)
-
+      def unindex()
+        idx = self.class.get_bulk(index_keys)
+        idx.each do |k, entries|
+          entries.delete(id)
+        end
+        self.class.remove_summary_for(id)
       end
 
       private
+      def summary
+        self.class.summary_for(id)
+      end
+      
       def index_keys
-        self.class.index_keys_for(id)
+        summary["keys"]
+      end
+      
+      def store(entries)
+        idx = self.class.get_bulk(entries.keys)
+        entries.each do |k, freq|
+          idx[k] = {} unless idx[k]
+          idx[k][self.id] = freq
+        end
+        self.class.set_bulk(idx)
+        nil
+      end
+      
+      def store_summary(summary)
+        self.class.store_summary_for(id, summary)
       end
 
       def store_at_keys(keys)
         idx = self.class.get_bulk(keys)
         keys.each do |k|
-          puts idx[k].inspect
           idx[k] = [] unless idx[k]
           idx[k] << id
           idx[k].uniq!
-          puts "%%%%%%%%%%%% #{idx.inspect}" if k.match("method$")
         end
         self.class.set_bulk(idx)
         nil
