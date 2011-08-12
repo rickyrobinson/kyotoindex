@@ -180,6 +180,7 @@ module KyotoIndex
       def index(*fields)
         fields = self.class.indexed_fields if fields.empty?
         index_entries = {}
+        entry = {"keys" => []}
         fields.each do |field|
           field_entries = Hash.new(0)
           options = self.class.index_config[field]
@@ -194,7 +195,7 @@ module KyotoIndex
             
           sentence_terms = sentences.map {|s| options[:split] ? s.split(options[:split]) : [s]}
           
-          entry = {"total_words" => sentence_terms.reduce(0) {|sum, st| sum += st.length}, "keys" => []}
+          entry["total_words"] = sentence_terms.reduce(0) {|sum, st| sum += st.length}
           
           sentence_terms.each do |terms|
             (1..options[:ngram]).each do |n|
