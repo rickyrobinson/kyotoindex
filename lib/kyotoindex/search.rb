@@ -63,13 +63,14 @@ module KyotoIndex
       end
 
       def find_in_any_field(raw_terms, fields)
-        
+
         # Need to do this term by term, then intersect the results
         results = fields.reduce(Hash.new([])) do |indices, field|
           terms = raw_terms.map { |t| prepare_term(field, t) }
           field_results = search_field_for(field, terms)
-          terms.each do |t|
-            indices[t] += (field_results[key_for(field, t)] || [])
+          
+          field_results.each do |k, v|
+            indices[k.split(":").last] += v.keys
           end
             
           indices
@@ -109,10 +110,9 @@ module KyotoIndex
       end
 
       def search_field_for(field, terms)
-        keys = terms.reduce([]) do |list, term|
-          list << key_for(field, term)
-        end
-        get_bulk(keys, index_config[field][:db])
+        term_ids = term_ids_for(terms, index_config[field][:db])
+        term_id_keys = term_ids.map {|id| key_for(field, id)}
+        get_bulk(term_id_keys, index_config[field][:db])
       end
 
       def indexed_fields
@@ -157,6 +157,11 @@ module KyotoIndex
 
       def key_for(field, term_id)
         "#{ki_namespace}:#{field.to_s}:#{term_id}"
+      end
+      
+      def term_ids_for(terms, db = :default)
+        term_keys = terms.map {|t| "#{ki_namespace}::term_id::#{t}"}
+        get_bulk(term_keys, db).values
       end
       
       def term_id_for(term, db = :default)
@@ -221,7 +226,7 @@ module KyotoIndex
             entry["keys"] << key
           end
           
-          nil
+          store(index_entries, options[:db])
         end
 
         # # Figure out the indexing plan
@@ -232,7 +237,6 @@ module KyotoIndex
         # next if new_keys.empty? and del_keys.empty?
 
         # Add new indices
-        store(index_entries)
         store_summary(entry)
 
         # # Delete indexes no longer used
@@ -247,6 +251,7 @@ module KyotoIndex
         index(fields)
       end
 
+      # This needs to be fixed to cater to different dbs for each field
       def unindex()
         idx = self.class.get_bulk(index_keys)
         idx.each do |k, entries|
@@ -264,18 +269,18 @@ module KyotoIndex
         summary["keys"]
       end
       
-      def store(entries)
-        idx = self.class.get_bulk(entries.keys)
+      def store(entries, db = :default)
+        idx = self.class.get_bulk(entries.keys, db)
         entries.each do |k, freq|
           idx[k] = {} unless idx[k]
           idx[k][id] = freq
         end
-        self.class.set_bulk(idx)
+        self.class.set_bulk(idx, db)
         nil
       end
       
-      def store_summary(summary)
-        self.class.store_summary_for(id, summary)
+      def store_summary(summary, db = :default)
+        self.class.store_summary_for(id, summary, db)
       end
 
       def store_at_keys(keys)
