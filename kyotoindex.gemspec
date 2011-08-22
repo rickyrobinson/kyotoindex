@@ -21,4 +21,6 @@ Gem::Specification.new do |s|
   
   s.add_dependency "msgpack"
   s.add_dependency "kyototycoon"
+  s.add_dependency "activesupport"
+  
 end

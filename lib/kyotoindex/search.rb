@@ -75,14 +75,15 @@ module KyotoIndex
       def find_in_any_field(raw_terms, fields)
 
         # Need to do this term by term, then intersect the results
-        results = fields.reduce(Hash.new([])) do |indices, field|
+        results = fields.reduce({}) do |indices, field|
           terms = raw_terms.map { |t| prepare_term(field, t) }
           field_results = search_field_for(field, terms)
+
           
           field_results.each do |k, v|
-            indices[k.split(":").last] += v.keys
+            indices[v["term_id"]] ||= {}
+            indices[v["term_id"]].merge!(v["index"]) {|k, o, n| o + n }
           end
-            
           indices
         end
 
@@ -92,12 +93,16 @@ module KyotoIndex
         
         if(values.length > 0)
           found = values.reduce(values.first.dup) do |intersection, result|
-            intersection = intersection & result
+            intersection = intersection.delete_if {|doc, freq| not result.has_key? doc }
+            intersection.each_key do |k|
+              intersection[k] += result[k]
+            end
+            intersection
           end
         end
 
-        found
-
+        ordered = ActiveSupport::OrderedHash[found.sort{|(n,c), (m,d)| d <=> c }]
+        ordered.keys
       end
 
       def find_in_fields(query)
@@ -140,8 +145,8 @@ module KyotoIndex
         kt(db).set_bulk(recs)
       end
 
-      def summaries_for(ids, db = :meta)
-        list = ids.map {|id| id.is_a? self ? "#{ki_namespace}:summary:#{id.id}" : "#{ki_namespace}:summary:#{id}" }
+      def summaries_for(objs, db = :meta)
+        list = objs.map {|obj| obj.is_a? self ? "#{ki_namespace}:summary:#{obj.id}" : "#{ki_namespace}:summary:#{obj}" }
         kt(db).get_bulk(list)
       end
 
