@@ -11,6 +11,7 @@ module KyotoIndex
   def self.setup(&block)
     yield self
     add_db :default unless @@databases[:default]
+    set_meta_db :default unless @@databases[:meta]
   end
 
   def self.add_db name, options={}
@@ -27,6 +28,10 @@ module KyotoIndex
   
   def self.set_default_db name, options={}
     @@databases[:default] = @@databases[name] || add_db(name, options)
+  end
+  
+  def self.set_meta_db name, options={}
+    @@databases[:meta] = @@databases[name] || add_db(name, options)
   end
   
   def self.set_stopwords stopwords

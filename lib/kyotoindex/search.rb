@@ -4,6 +4,7 @@ module KyotoIndex
       def included(klass)
         # The index options for all indexed fields
         klass.instance_variable_set('@index_config', {})
+        klass.instance_variable_set('@field_map', {})
         klass.send :include, InstanceMethods
         klass.extend ClassMethods
       end
@@ -13,13 +14,19 @@ module KyotoIndex
       
       attr_reader :index_config
       
+      # The field map is used to optimise indexing and querying.
+      # Since most of the time most fields will be configured to use the
+      # same database, it makes sense to group/batch operations for these fields.
+      attr_reader :field_map
+      
       # Specify one or more attributes to index.
       # @overload add_index(attributes, options={})
       # @param [Array] attributes a list of one or more attributes/fields
       # @param [Hash] options controls how the specified fields are indexed
       # @options options [Integer] :ngram (1) The maximum length of sequential words to index
       # @options options [Integer] :minlength (2) The minimum word length to index
-      # @options options [Regexp] :split (/\s+/) A regular expression defining how to split the text
+      # @options options [Regexp] :split (/\s+/) A regular expression defining how to split sentences into terms
+      # @options options [Regexp] :sentence_split (/[.?!;](?: |$)/) A regular expression defining how to split text into sentences
       # @options options [Array] :stopwords A list of words that should be excluded from the index
       # @options options [Symbol] :db (:default) The name of the database (must be configured) to store the index for this field
       # @example add_index :foo, :bar, :ngram => 5, :db => :my_in_memory_db
@@ -34,6 +41,9 @@ module KyotoIndex
         options[:db] ||= :default
         args.each do |attribute|
           index_config[attribute.to_sym] = options
+          field_list = field_map[options[:db]] || []
+          field_list << attribute.to_sym
+          field_map[options[:db]] = field_list
         end
       end
 
@@ -110,9 +120,8 @@ module KyotoIndex
       end
 
       def search_field_for(field, terms)
-        term_ids = term_ids_for(terms, index_config[field][:db])
-        term_id_keys = term_ids.map {|id| key_for(field, id)}
-        get_bulk(term_id_keys, index_config[field][:db])
+        term_keys = terms.map {|t| key_for(field, t)}
+        get_bulk(term_keys, index_config[field][:db])
       end
 
       def indexed_fields
@@ -131,16 +140,21 @@ module KyotoIndex
         kt(db).set_bulk(recs)
       end
 
-      def summary_for(id, db = :default)
-        kt(db).get("#{ki_namespace}::summary::#{id}")
+      def summaries_for(ids, db = :meta)
+        list = ids.map {|id| id.is_a? self ? "#{ki_namespace}:summary:#{id.id}" : "#{ki_namespace}:summary:#{id}" }
+        kt(db).get_bulk(list)
+      end
+
+      def summary_for(id, db = :meta)
+        kt(db).get("#{ki_namespace}:summary:#{id}")
       end
       
-      def store_summary_for(id, summary, db = :default)
-        kt(db).set("#{ki_namespace}::summary::#{id}", summary)
+      def store_summary_for(id, summary, db = :meta)
+        kt(db).set("#{ki_namespace}:summary:#{id}", summary)
       end
       
-      def remove_summary_for(id, db = :default)
-        kt(db).remove("#{ki_namespace}::summary::#{id}")
+      def remove_summary_for(id, db = :meta)
+        kt(db).remove("#{ki_namespace}:summary:#{id}")
       end
       
       def prepare_term(field, term)
@@ -155,26 +169,26 @@ module KyotoIndex
         term.gsub(/[^\w\s]+/, '').gsub(/\s{2,}/, ' ').downcase
       end
 
-      def key_for(field, term_id)
-        "#{ki_namespace}:#{field.to_s}:#{term_id}"
+      def key_for(field, term)
+        "#{ki_namespace}:field:#{field.to_s}:#{term}"
       end
       
-      def term_ids_for(terms, db = :default)
-        term_keys = terms.map {|t| "#{ki_namespace}::term_id::#{t}"}
+      def term_ids_for(terms, db = :meta)
+        term_keys = terms.map {|t| "#{ki_namespace}:term_id:#{t}"}
         get_bulk(term_keys, db).values
       end
       
-      def term_id_for(term, db = :default)
-        term_id = kt(db).get("#{ki_namespace}::term_id::#{term}")
+      def term_id_for(term, db = :meta)
+        term_id = kt(db).get("#{ki_namespace}:term_id:#{term}")
         unless term_id
-          term_id = kt(db).increment("#{ki_namespace}::next_term_id")
-          kt(db).set("#{ki_namespace}::term_id::#{term}", term_id)
+          term_id = kt(db).increment("#{ki_namespace}:next_term_id")
+          kt(db).set("#{ki_namespace}:term_id:#{term}", term_id)
         end
         term_id.to_i
       end
       
       def ki_namespace
-        @ki_namespace ||= "KyotoIndex::#{self.name}"
+        @ki_namespace ||= "KyotoIndex:#{self.name}"
       end
     end
 
@@ -182,51 +196,70 @@ module KyotoIndex
       # Index the specified fields or all configured fields if none specified
       # @param [Array] fields the list of (configured) fields to index
       # @note This currently assumes the object has not been previously indexed
-      def index(*fields)
-        fields = self.class.indexed_fields if fields.empty?
+      # Creates an index that looks like:
+      # KyotoIndex:ModelName:field:field_name:term => {"term_id" => id, "index" => {doc_id1 => 0.2, doc_id2 => 0.12, doc_id3 => 0.09}}
+      # KyotoIndex:ModelName:term_id:term => id
+      # KyotoIndex:ModelName:next_term_id => num
+      # KyotoIndex:ModelName:summary:id => {"terms" => {term_id => {field_name => freq}}, "total_words" => 651}
+      def index(*field_list)
+        fields_to_index = nil
+        
+        # Get a map of dbs to fields
+        if field_list.empty?
+          fields_to_index = self.class.field_map
+        else
+          fields_to_index = field_list.group_by {|f| self.class.index_config[f][:db]}
+        end
         index_entries = {}
-        entry = {"keys" => []}
-        fields.each do |field|
-          field_entries = Hash.new(0)
-          options = self.class.index_config[field]
-          value = self.send(field)
-          next if value.nil?
-          sentences = nil
-          if value.is_a?(Array)
-            sentences = value
-          else
-            sentences = options[:sentence_split] ? value.split(options[:sentence_split]) : [value]
-          end
+        doc_summary = {"terms" => {}, "total_words" => 0}
+        
+        fields_to_index.each do |db, fields|
+          fields.each do |field|
+            field_entries = Hash.new(0)
+            options = self.class.index_config[field]
+            value = self.send(field)
+            next if value.nil?
+            sentences = nil
+            if value.is_a?(Array)
+              sentences = value
+            else
+              sentences = options[:sentence_split] ? value.split(options[:sentence_split]) : [value]
+            end
             
-          sentence_terms = sentences.map {|s| options[:split] ? s.split(options[:split]) : [s]}
+            sentence_terms = sentences.map {|s| options[:split] ? s.split(options[:split]) : [s]}
           
-          entry["total_words"] = sentence_terms.reduce(0) {|sum, st| sum += st.length}
+            term_count = sentence_terms.reduce(0) {|sum, st| sum += st.length}
+            doc_summary["total_words"] += term_count
           
-          sentence_terms.each do |terms|
-            (1..options[:ngram]).each do |n|
-              terms.each_cons(n) do |seq|
-                # We don't care about this ngram if it starts or ends with a stop word
-                # The non-stop word portion of the string will already have been indexed
-                # on a previous iteration. i.e., when n was smaller.
-                next if options[:stopwords].any? { |x| [seq.first, seq.last].include? x }
-                # Concatenate ngram components and remove non alphanum/whitespace chars.
-                ngram = self.class.clean_term(seq.join(" "))
-                next if ngram.length < options[:minlength]
+            sentence_terms.each do |terms|
+              (1..options[:ngram]).each do |n|
+                terms.each_cons(n) do |seq|
+                  # We don't care about this ngram if it starts or ends with a stop word
+                  # The non-stop word portion of the string will already have been indexed
+                  # on a previous iteration. i.e., when n was smaller.
+                  next if options[:stopwords].any? { |x| [seq.first, seq.last].include? x }
+                  # Concatenate ngram components and remove non alphanum/whitespace chars.
+                  ngram = self.class.clean_term(seq.join(" "))
+                  next if ngram.length < options[:minlength]
               
-                field_entries[ngram] += 1
+                  field_entries[ngram] += 1
 
+                end
               end
             end
-          end
           
-          field_entries.each do |ngram, count|
-            term_id = self.class.term_id_for(ngram)
-            key = self.class.key_for(field, term_id)
-            index_entries[key] = count / entry["total_words"].to_f
-            entry["keys"] << key
+            field_entries.each do |ngram, count|
+              key = self.class.key_for(field, ngram)
+              term_id = self.class.term_id_for(ngram)
+              freq = count / term_count.to_f
+              index_entries[key] = {:term_id => term_id, :freq =>  freq}
+              term_vector = doc_summary["terms"][term_id] || {}
+              term_vector[field] = freq
+              doc_summary["terms"][term_id] = term_vector
+            end
           end
-          
-          store(index_entries, options[:db])
+          # Store the batch
+          store(index_entries, db)
         end
 
         # # Figure out the indexing plan
@@ -237,7 +270,7 @@ module KyotoIndex
         # next if new_keys.empty? and del_keys.empty?
 
         # Add new indices
-        store_summary(entry)
+        store_summary(doc_summary)
 
         # # Delete indexes no longer used
         # exec_pipelined_index_cmd(:srem, del_indexes)
@@ -252,46 +285,32 @@ module KyotoIndex
       end
 
       # This needs to be fixed to cater to different dbs for each field
-      def unindex()
-        idx = self.class.get_bulk(index_keys)
-        idx.each do |k, entries|
-          entries.delete(id)
-        end
-        self.class.remove_summary_for(id)
-      end
+      # def unindex()
+      #   idx = self.class.get_bulk(index_keys)
+      #   idx.each do |k, entries|
+      #     entries.delete(id)
+      #   end
+      #   self.class.remove_summary_for(id)
+      # end
 
-      private
       def summary
         self.class.summary_for(id)
       end
-      
-      def index_keys
-        summary["keys"]
-      end
+
+      private
       
       def store(entries, db = :default)
         idx = self.class.get_bulk(entries.keys, db)
-        entries.each do |k, freq|
-          idx[k] = {} unless idx[k]
-          idx[k][id] = freq
+        entries.each do |k, entry|
+          idx[k] = {"term_id" => entry[:term_id], "index" => {}} unless idx[k]
+          idx[k]["index"][id] = entry[:freq]
         end
         self.class.set_bulk(idx, db)
         nil
       end
       
-      def store_summary(summary, db = :default)
-        self.class.store_summary_for(id, summary, db)
-      end
-
-      def store_at_keys(keys)
-        idx = self.class.get_bulk(keys)
-        keys.each do |k|
-          idx[k] = [] unless idx[k]
-          idx[k] << id
-          idx[k].uniq!
-        end
-        self.class.set_bulk(idx)
-        nil
+      def store_summary(doc_summary, db = :meta)
+        self.class.store_summary_for(id, doc_summary, db)
       end
     end
   end
