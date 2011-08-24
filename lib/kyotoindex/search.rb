@@ -71,6 +71,15 @@ module KyotoIndex
           nil
         end
       end
+      
+      def summaries_for(objs, db = :meta)
+        summaries = {}
+        list = objs.map {|obj| "#{ki_namespace}:summary:#{obj.id}" }
+        summaries["summaries"] = kt(db).get_bulk(list)
+        term_ids = summaries["summaries"].map { |k,v| v["terms"].keys }.flatten.uniq
+        summaries["term_map"] = terms_for(term_ids)
+        summaries
+      end
 
       def find_in_any_field(raw_terms, fields)
 
@@ -79,10 +88,10 @@ module KyotoIndex
           terms = raw_terms.map { |t| prepare_term(field, t) }
           field_results = search_field_for(field, terms)
 
-          
+          # Creates structure like {123 => {doc1 => 2, doc3 => 4}, 254 => {doc1 => 2}}
           field_results.each do |k, v|
             indices[v["term_id"]] ||= {}
-            indices[v["term_id"]].merge!(v["index"]) {|k, o, n| o + n }
+            indices[v["term_id"]].merge!(v["index"]) {|k, o, n| (o || 0) + (n || 0) }
           end
           indices
         end
@@ -93,16 +102,21 @@ module KyotoIndex
         
         if(values.length > 0)
           found = values.reduce(values.first.dup) do |intersection, result|
-            intersection = intersection.delete_if {|doc, freq| not result.has_key? doc }
+            intersection = intersection.delete_if {|doc, count| not result.has_key? doc }
+            result = result.delete_if {|doc, count| not intersection.has_key? doc }
             intersection.each_key do |k|
-              intersection[k] += result[k]
+              intersection[k] += (result[k] || 0)
             end
             intersection
           end
         end
 
-        ordered = ActiveSupport::OrderedHash[found.sort{|(n,c), (m,d)| d <=> c }]
-        ordered.keys
+        if found
+          ordered = ActiveSupport::OrderedHash[found.sort{|(n,c), (m,d)| d <=> c }]
+          ordered.keys
+        else
+          []
+        end
       end
 
       def find_in_fields(query)
@@ -145,11 +159,6 @@ module KyotoIndex
         kt(db).set_bulk(recs)
       end
 
-      def summaries_for(objs, db = :meta)
-        list = objs.map {|obj| obj.is_a? self ? "#{ki_namespace}:summary:#{obj.id}" : "#{ki_namespace}:summary:#{obj}" }
-        kt(db).get_bulk(list)
-      end
-
       def summary_for(id, db = :meta)
         kt(db).get("#{ki_namespace}:summary:#{id}")
       end
@@ -178,6 +187,11 @@ module KyotoIndex
         "#{ki_namespace}:field:#{field.to_s}:#{term}"
       end
       
+      def terms_for(term_ids, db = :meta)
+          term_keys = term_ids.map {|t| "#{ki_namespace}:term:#{t}"}
+          get_bulk(term_keys, db).values
+        end
+      
       def term_ids_for(terms, db = :meta)
         term_keys = terms.map {|t| "#{ki_namespace}:term_id:#{t}"}
         get_bulk(term_keys, db).values
@@ -188,6 +202,7 @@ module KyotoIndex
         unless term_id
           term_id = kt(db).increment("#{ki_namespace}:next_term_id")
           kt(db).set("#{ki_namespace}:term_id:#{term}", term_id)
+          kt(db).set("#{ki_namespace}:term:#{term_id}", {"term" => term, "length" => term.split.length})
         end
         term_id.to_i
       end
@@ -202,10 +217,11 @@ module KyotoIndex
       # @param [Array] fields the list of (configured) fields to index
       # @note This currently assumes the object has not been previously indexed
       # Creates an index that looks like:
-      # KyotoIndex:ModelName:field:field_name:term => {"term_id" => id, "index" => {doc_id1 => 0.2, doc_id2 => 0.12, doc_id3 => 0.09}}
+      # KyotoIndex:ModelName:field:field_name:term => {"term_id" => id, "index" => {doc_id1 => 12, doc_id2 => 3, doc_id3 => 1}}
       # KyotoIndex:ModelName:term_id:term => id
+      # KyotoIndex:ModelName:term:id => {"term" => term, "length" => term.split.length}
       # KyotoIndex:ModelName:next_term_id => num
-      # KyotoIndex:ModelName:summary:id => {"terms" => {term_id => {field_name => freq}}, "total_words" => 651}
+      # KyotoIndex:ModelName:summary:id => {"terms" => {term_id => {field_id => count}}, "total_words" => 651}
       def index(*field_list)
         fields_to_index = nil
         
@@ -221,6 +237,7 @@ module KyotoIndex
         fields_to_index.each do |db, fields|
           fields.each do |field|
             field_entries = Hash.new(0)
+            field_id = self.class.term_id_for(field.to_s)
             options = self.class.index_config[field]
             value = self.send(field)
             next if value.nil?
@@ -256,10 +273,9 @@ module KyotoIndex
             field_entries.each do |ngram, count|
               key = self.class.key_for(field, ngram)
               term_id = self.class.term_id_for(ngram)
-              freq = count / term_count.to_f
-              index_entries[key] = {:term_id => term_id, :freq =>  freq}
+              index_entries[key] = {:term_id => term_id, :count =>  count}
               term_vector = doc_summary["terms"][term_id] || {}
-              term_vector[field] = freq
+              term_vector[field_id] = count
               doc_summary["terms"][term_id] = term_vector
             end
           end
@@ -308,7 +324,7 @@ module KyotoIndex
         idx = self.class.get_bulk(entries.keys, db)
         entries.each do |k, entry|
           idx[k] = {"term_id" => entry[:term_id], "index" => {}} unless idx[k]
-          idx[k]["index"][id] = entry[:freq]
+          idx[k]["index"][id] = entry[:count]
         end
         self.class.set_bulk(idx, db)
         nil
